@@ -2,13 +2,11 @@
 
 One task in, split into parallel beams, best result out.
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jcoeyman/prism)
+
 Prism is a parallel hyperparameter search agent running entirely on Cloudflare. One orchestrator fans out sub-agents that run experiments in sandboxed Linux containers. Everything checkpoints. Everything resumes on crash. No GPUs, no external services, no idle costs.
 
 Built on [Think](https://developers.cloudflare.com/agents/api-reference/think/), [sub-agents](https://developers.cloudflare.com/agents/api-reference/sub-agents/), [durable execution](https://developers.cloudflare.com/agents/api-reference/durable-execution/), and [Sandbox](https://developers.cloudflare.com/sandbox/).
-
-```
-npm install && npx wrangler deploy
-```
 
 ---
 
