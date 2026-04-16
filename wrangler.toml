@@ -3,8 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2026-04-16"
 compatibility_flags = ["nodejs_compat", "experimental"]
 
-# Protected by API_SECRET + Cloudflare Access
-workers_dev = false
+# The default workers.dev URL is enabled so the Deploy to Cloudflare button
+# gives users a working endpoint out of the box. Auth is enforced only when
+# API_SECRET is set — set it BEFORE deploying:
+#   echo -n "$(openssl rand -base64 32)" | npx wrangler secret put API_SECRET
+workers_dev = true
 
 # Sandbox container image
 [[containers]]
@@ -20,8 +23,9 @@ name = "Orchestrator"
 class_name = "Sandbox"
 name = "Sandbox"
 
-# Migrations — Orchestrator uses SQLite for fibers + stash,
-# Sandbox is required by @cloudflare/sandbox
+# Migrations: both classes use SQLite storage.
+# Orchestrator stores fiber state and sweep snapshots.
+# Sandbox is required by @cloudflare/sandbox.
 [[migrations]]
 new_sqlite_classes = ["Orchestrator", "Sandbox"]
 tag = "v1"

@@ -1,0 +1,4 @@
+# Bearer token required on every request. Generate one with:
+#   openssl rand -base64 32
+# In production, set via `wrangler secret put API_SECRET`.
+API_SECRET=change-me

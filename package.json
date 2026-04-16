@@ -1,17 +1,21 @@
 {
   "name": "prism",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "tsx test/e2e.test.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json"
   },
   "dependencies": {
-    "agents": "0.11.0",
-    "@cloudflare/sandbox": "0.8.11"
+    "@cloudflare/sandbox": "0.8.11",
+    "agents": "0.11.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20260416.2",
+    "@types/node": "^25.6.0",
+    "tsx": "4.21.0",
     "typescript": "6.0.2",
     "wrangler": "4.83.0"
   }
