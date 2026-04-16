@@ -162,12 +162,23 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Fail closed: if API_SECRET isn't configured, refuse every request.
+    // Set it before first deploy:
+    //   echo -n "$(openssl rand -base64 32)" | npx wrangler secret put API_SECRET
+    if (!env.API_SECRET) {
+      return Response.json(
+        {
+          error: "server not configured",
+          fix: "set API_SECRET via `wrangler secret put API_SECRET`",
+        },
+        { status: 503 },
+      );
+    }
+
     // Auth check (bearer token). Runs before any routing.
-    if (env.API_SECRET) {
-      const auth = request.headers.get("Authorization");
-      if (auth !== `Bearer ${env.API_SECRET}`) {
-        return Response.json({ error: "unauthorized" }, { status: 401 });
-      }
+    const auth = request.headers.get("Authorization");
+    if (auth !== `Bearer ${env.API_SECRET}`) {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
     }
 
     // GET / → landing page

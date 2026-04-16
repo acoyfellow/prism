@@ -27,14 +27,15 @@ npm install
 ### 2. Set the auth secret and deploy
 
 ```sh
-# Set the API bearer token before deploying (so auth is active from byte 0)
+# Set the API bearer token BEFORE deploying.
+# Without this, the Worker returns 503 for every request — fail closed.
 echo -n "$(openssl rand -base64 32)" | npx wrangler secret put API_SECRET
 
 # Deploy
 npx wrangler deploy
 ```
 
-Wrangler prints the Worker URL. Copy it, and save the secret you generated — you'll need it on every request.
+Save the secret — you'll need it on every request. For belt-and-suspenders, add Cloudflare Access on the route afterwards: Dashboard → Workers & Pages → prism → Settings → Domains & Routes → Enable Cloudflare Access.
 
 ### 3. Start a sweep
 
