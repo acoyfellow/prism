@@ -1,14 +1,42 @@
 import { Agent, getAgentByName } from "agents";
 import { getSandbox, Sandbox } from "@cloudflare/sandbox";
 import type { FiberRecoveryContext } from "agents";
+import { Hono } from "hono";
+import { bearerAuth } from "hono/bearer-auth";
+import { HTTPException } from "hono/http-exception";
 
 export { Sandbox } from "@cloudflare/sandbox";
 
 // --- Constants ---
 
-const RUNNERS = ["runner-a", "runner-b", "runner-c"] as const;
-type Runner = (typeof RUNNERS)[number];
+// Each runner gets a different "style" system prompt so the LLM produces
+// genuinely different Python for the same task. Three parallel approaches,
+// one winning runtime.
+const RUNNERS = [
+  {
+    id: "runner-a",
+    style: "minimal",
+    systemPrompt:
+      "You write the shortest correct Python possible. Single function. Standard library only. No comments, no type hints.",
+  },
+  {
+    id: "runner-b",
+    style: "idiomatic",
+    systemPrompt:
+      "You write clean, idiomatic Python. Use generators, comprehensions, and stdlib tools (itertools, functools, collections) where appropriate.",
+  },
+  {
+    id: "runner-c",
+    style: "algorithmic",
+    systemPrompt:
+      "You write Python that optimizes for speed. Prefer lower time complexity over readability. Use efficient data structures.",
+  },
+] as const;
 
+type Runner = (typeof RUNNERS)[number];
+type RunnerId = Runner["id"];
+
+const MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
 const MAX_TASK_LENGTH = 500;
 
 // --- Types ---
@@ -16,49 +44,110 @@ const MAX_TASK_LENGTH = 500;
 interface Env {
   Orchestrator: DurableObjectNamespace<Orchestrator>;
   Sandbox: DurableObjectNamespace<Sandbox>;
-  API_SECRET: string; // set via `wrangler secret put API_SECRET`
+  AI: Ai;
+  API_SECRET: string;
 }
 
 interface ExperimentResult {
-  runner: string;
-  output: string;
+  runner: RunnerId;
+  style: string;
+  script: string;      // the Python the LLM generated
+  stdout: string;
+  stderr: string;
+  duration_ms: number; // wall-clock runtime inside the sandbox
   status: "done" | "error";
 }
 
 interface SweepSnapshot {
   task: string;
   completed: ExperimentResult[];
-  pending: Runner[];
+  pending: RunnerId[];
   status: "running" | "done" | "error";
+}
+
+// --- LLM code generation ---
+
+const BASE_SYSTEM = `You are a Python code generator. Given a task, you output ONLY runnable Python code — no markdown fences, no prose, no explanation. The code must:
+- be a complete, self-contained program
+- use only the Python standard library
+- print meaningful results to stdout (runtime, final value, summary)
+- time itself and print "runtime_ms: <number>" on the last line
+- finish in under 30 seconds`;
+
+async function generatePython(ai: Ai, task: string, runner: Runner): Promise<string> {
+  const systemPrompt = `${BASE_SYSTEM}\n\nStyle: ${runner.systemPrompt}`;
+  const response = (await ai.run(MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: task },
+    ],
+    max_tokens: 1024,
+  })) as { response?: string };
+
+  let code = (response.response ?? "").trim();
+  // Strip markdown fences if the model added them despite instructions.
+  code = code.replace(/^```(?:python)?\s*\n?/i, "").replace(/\n?```\s*$/i, "");
+  return code.trim();
 }
 
 // --- Experiment Runner (sub-agent) ---
 
 export class ExperimentRunner extends Agent<Env> {
-  async runExperiment(runner: Runner, task: string): Promise<ExperimentResult> {
-    const sandbox = getSandbox(this.env.Sandbox, `sandbox-${runner}`);
+  async runExperiment(runnerId: RunnerId, task: string): Promise<ExperimentResult> {
+    const runner = RUNNERS.find((r) => r.id === runnerId);
+    if (!runner) return errorResult(runnerId, "unknown", "", "unknown runner");
 
-    await sandbox.writeFile("/workspace/task.txt", task);
-    await sandbox.writeFile("/workspace/experiment.py", experimentScript(runner));
+    let script = "";
+    try {
+      script = await generatePython(this.env.AI, task, runner);
+    } catch (e) {
+      return errorResult(runnerId, runner.style, "", `codegen failed: ${errString(e)}`);
+    }
+    if (!script) return errorResult(runnerId, runner.style, "", "LLM returned empty code");
 
-    const result = await sandbox.exec("python3 /workspace/experiment.py", {
-      timeout: 120_000,
-    });
+    const sandbox = getSandbox(this.env.Sandbox, `sandbox-${runnerId}`);
+    await sandbox.writeFile("/workspace/experiment.py", script);
+
+    const startedAt = Date.now();
+    const result = await sandbox.exec("python3 /workspace/experiment.py", { timeout: 60_000 });
+    const duration_ms = Date.now() - startedAt;
 
     if (!result.success) {
-      return { runner, output: result.stderr || "experiment failed", status: "error" };
+      return {
+        runner: runnerId,
+        style: runner.style,
+        script,
+        stdout: result.stdout?.trim() ?? "",
+        stderr: (result.stderr || "execution failed").slice(0, 2000),
+        duration_ms,
+        status: "error",
+      };
     }
 
-    return { runner, output: result.stdout.trim(), status: "done" };
+    return {
+      runner: runnerId,
+      style: runner.style,
+      script,
+      stdout: result.stdout.trim().slice(0, 4000),
+      stderr: "",
+      duration_ms,
+      status: "done",
+    };
   }
+}
+
+function errorResult(runner: RunnerId, style: string, script: string, err: string): ExperimentResult {
+  return { runner, style, script, stdout: "", stderr: err, duration_ms: 0, status: "error" };
+}
+
+function errString(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 // --- Orchestrator ---
 
 export class Orchestrator extends Agent<Env> {
-  // Routed via `routeAgentRequest` — the agents SDK sets `this.name` for us.
   async onRequest(request: Request): Promise<Response> {
-    // GET /agents/orchestrator/<id> — return current snapshot (for polling/resumption)
     if (request.method === "GET") {
       const snapshot = await this.getSnapshot();
       return snapshot
@@ -71,28 +160,24 @@ export class Orchestrator extends Agent<Env> {
     }
 
     const body = (await request.json()) as { task?: string };
-    if (!body.task) {
-      return Response.json({ error: "missing task" }, { status: 400 });
-    }
+    if (!body.task) return Response.json({ error: "missing task" }, { status: 400 });
 
     const results = await this.runSweep(body.task);
-    return Response.json({ sweepId: this.name, results });
+    return Response.json({ sweepId: this.name, task: body.task, results });
   }
 
   async runSweep(task: string): Promise<ExperimentResult[]> {
-    const runners: Runner[] = [...RUNNERS];
+    const runnerIds: RunnerId[] = RUNNERS.map((r) => r.id);
 
     return this.runFiber("sweep", async (ctx) => {
-      // Persist snapshot to our own table — survives fiber completion (runFiber deletes
-      // its row from cf_agents_runs on exit, so we can't rely on that for polling).
-      this.persistSnapshot({ task, completed: [], pending: runners, status: "running" });
-      ctx.stash({ task, completed: [], pending: runners, status: "running" } satisfies SweepSnapshot);
+      this.persistSnapshot({ task, completed: [], pending: runnerIds, status: "running" });
+      ctx.stash({ task, completed: [], pending: runnerIds, status: "running" } satisfies SweepSnapshot);
 
       const results = await Promise.all(
-        runners.map(async (runner) => {
-          const stub = await this.subAgent(ExperimentRunner, runner);
-          return stub.runExperiment(runner, task);
-        })
+        runnerIds.map(async (id) => {
+          const stub = await this.subAgent(ExperimentRunner, id);
+          return stub.runExperiment(id, task);
+        }),
       );
 
       const finalSnapshot: SweepSnapshot = { task, completed: results, pending: [], status: "done" };
@@ -102,7 +187,6 @@ export class Orchestrator extends Agent<Env> {
     });
   }
 
-  // Return the latest persisted snapshot (used by GET for polling/resume after DO restart)
   async getSnapshot(): Promise<SweepSnapshot | null> {
     this.ensureSnapshotTable();
     const rows = this.sql`SELECT data FROM prism_snapshot WHERE id = 1`;
@@ -124,25 +208,19 @@ export class Orchestrator extends Agent<Env> {
     this.sql`CREATE TABLE IF NOT EXISTS prism_snapshot (id INTEGER PRIMARY KEY, data TEXT NOT NULL)`;
   }
 
-  // On DO eviction mid-sweep, resume pending experiments. Result is persisted so
-  // GET /sweeps/<id> returns the updated snapshot even though the original HTTP
-  // caller's request has already timed out.
   async onFiberRecovered(ctx: FiberRecoveryContext) {
     if (ctx.name !== "sweep") return;
-
     const snapshot = ctx.snapshot as SweepSnapshot | null;
     if (!snapshot || snapshot.pending.length === 0 || snapshot.status !== "running") return;
 
     void this.runFiber("sweep", async (fiberCtx) => {
       const results = [...snapshot.completed];
-
       const remaining = await Promise.all(
-        snapshot.pending.map(async (runner) => {
-          const stub = await this.subAgent(ExperimentRunner, runner);
-          return stub.runExperiment(runner, snapshot.task);
-        })
+        snapshot.pending.map(async (id) => {
+          const stub = await this.subAgent(ExperimentRunner, id);
+          return stub.runExperiment(id, snapshot.task);
+        }),
       );
-
       results.push(...remaining);
       const finalSnapshot: SweepSnapshot = {
         task: snapshot.task,
@@ -156,140 +234,78 @@ export class Orchestrator extends Agent<Env> {
   }
 }
 
-// --- Worker entry point ---
+// --- Worker entry point (Hono) ---
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+const app = new Hono<{ Bindings: Env }>();
 
-    // Fail closed: if API_SECRET isn't configured, refuse every request.
-    // Set it before first deploy:
-    //   echo -n "$(openssl rand -base64 32)" | npx wrangler secret put API_SECRET
-    if (!env.API_SECRET) {
-      return Response.json(
-        {
-          error: "server not configured",
-          fix: "set API_SECRET via `wrangler secret put API_SECRET`",
-        },
-        { status: 503 },
-      );
-    }
+// Fail closed before auth: if API_SECRET isn't set, refuse every request.
+app.use("*", async (c, next) => {
+  if (!c.env.API_SECRET) {
+    return c.json(
+      { error: "server not configured", fix: "set API_SECRET via `wrangler secret put API_SECRET`" },
+      503,
+    );
+  }
+  return next();
+});
 
-    // Auth check (bearer token). Runs before any routing.
-    const auth = request.headers.get("Authorization");
-    if (auth !== `Bearer ${env.API_SECRET}`) {
-      return Response.json({ error: "unauthorized" }, { status: 401 });
-    }
+// Bearer auth on everything.
+app.use("*", (c, next) => bearerAuth({ token: c.env.API_SECRET })(c, next));
 
-    // GET / → landing page
-    if (url.pathname === "/" && request.method === "GET") {
-      return Response.json({
-        name: "prism",
-        description: "Parallel experiment runner on Cloudflare agents + sandboxes",
-        usage: {
-          start: "POST / with { \"task\": \"<description>\" }",
-          poll: "GET /sweeps/<sweepId>",
-        },
-      });
-    }
+app.get("/", (c) =>
+  c.json({
+    name: "prism",
+    description:
+      "Parallel Python execution on Cloudflare. The orchestrator generates different Python approaches via Workers AI and runs each in its own sandbox.",
+    usage: {
+      start: 'POST / with { "task": "<description in English>" }',
+      poll: "GET /sweeps/<sweepId>",
+    },
+    runners: RUNNERS.map((r) => ({ id: r.id, style: r.style })),
+  }),
+);
 
-    // GET /sweeps/<id> → poll an existing sweep
-    const pollMatch = url.pathname.match(/^\/sweeps\/([0-9a-f-]{36})$/);
-    if (pollMatch && request.method === "GET") {
-      const stub = await getAgentByName(env.Orchestrator, pollMatch[1]);
-      return stub.fetch(new Request(url.toString(), { method: "GET" }));
-    }
+app.post("/", async (c) => {
+  let body: { task?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw new HTTPException(400, { message: "invalid JSON body" });
+  }
 
-    // POST / → start a new sweep
-    if (url.pathname === "/" && request.method === "POST") {
-      let body: { task?: unknown };
-      try {
-        body = await request.json();
-      } catch {
-        return Response.json({ error: "invalid JSON body" }, { status: 400 });
-      }
+  if (typeof body.task !== "string" || body.task.length === 0) {
+    throw new HTTPException(400, { message: "missing 'task' in request body" });
+  }
+  if (body.task.length > MAX_TASK_LENGTH) {
+    throw new HTTPException(400, {
+      message: `task must be under ${MAX_TASK_LENGTH} characters`,
+    });
+  }
 
-      if (typeof body.task !== "string" || body.task.length === 0) {
-        return Response.json({ error: "missing 'task' in request body" }, { status: 400 });
-      }
-      if (body.task.length > MAX_TASK_LENGTH) {
-        return Response.json(
-          { error: `task must be under ${MAX_TASK_LENGTH} characters` },
-          { status: 400 },
-        );
-      }
+  const task = body.task.replace(/[\x00-\x1f\x7f]/g, "");
+  const sweepId = crypto.randomUUID();
+  const stub = await getAgentByName(c.env.Orchestrator, sweepId);
 
-      const task = body.task.replace(/[\x00-\x1f\x7f]/g, "");
-      const sweepId = crypto.randomUUID();
-      const stub = await getAgentByName(env.Orchestrator, sweepId);
+  return stub.fetch(
+    new Request(new URL(c.req.url).toString(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task }),
+    }),
+  );
+});
 
-      return stub.fetch(new Request(url.toString(), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task }),
-      }));
-    }
+app.get("/sweeps/:id{[0-9a-f-]{36}}", async (c) => {
+  const id = c.req.param("id");
+  const stub = await getAgentByName(c.env.Orchestrator, id);
+  return stub.fetch(new Request(new URL(c.req.url).toString(), { method: "GET" }));
+});
 
-    return new Response("not found", { status: 404 });
-  },
-} satisfies ExportedHandler<Env>;
+app.notFound((c) => c.json({ error: "not found" }, 404));
 
-// --- Simulated experiment scripts ---
-// These are pure-Python simulations, not real ML frameworks. The demo is about the
-// pattern (parallel agents → sandboxes → aggregated results), not the training code.
-// To run real training: increase Sandbox instance_type in wrangler.toml, add real
-// pip installs, and swap these scripts for real model code.
+app.onError((err, c) => {
+  if (err instanceof HTTPException) return err.getResponse();
+  return c.json({ error: errString(err) }, 500);
+});
 
-function experimentScript(runner: Runner): string {
-  const scripts: Record<Runner, string> = {
-    "runner-a": `
-import json, random, math
-
-random.seed(42)
-task = open("/workspace/task.txt").read()
-
-best_lr, best_loss = None, float("inf")
-for lr in [0.1, 0.01, 0.001, 0.0001]:
-    loss = 2.3
-    for step in range(200):
-        grad = random.gauss(0, 1) * math.exp(-step * lr * 0.5)
-        loss -= lr * grad
-        loss = max(loss, 0.01)
-    loss += random.gauss(0, 0.05)
-    if loss < best_loss:
-        best_lr, best_loss = lr, loss
-
-print(json.dumps({"task": task, "best_lr": best_lr, "best_loss": round(best_loss, 6)}))
-`,
-    "runner-b": `
-import json, random
-
-random.seed(7)
-task = open("/workspace/task.txt").read()
-
-best_lr, best_loss = None, float("inf")
-for lr in [0.1, 0.01, 0.001, 0.0001]:
-    loss = 2.3 * (1 - lr * 10) ** 20 + random.gauss(0, 0.01)
-    if loss < best_loss:
-        best_lr, best_loss = lr, loss
-
-print(json.dumps({"task": task, "best_lr": best_lr, "best_loss": round(best_loss, 6)}))
-`,
-    "runner-c": `
-import json, random
-
-random.seed(99)
-task = open("/workspace/task.txt").read()
-
-best_lr, best_loss = None, float("inf")
-for lr in [0.1, 0.01, 0.001, 0.0001]:
-    loss = 2.3 * (1 - lr * 8) ** 15 + random.gauss(0, 0.02)
-    if loss < best_loss:
-        best_lr, best_loss = lr, loss
-
-print(json.dumps({"task": task, "best_lr": best_lr, "best_loss": round(best_loss, 6)}))
-`,
-  };
-
-  return scripts[runner];
-}
+export default app;

@@ -1,0 +1,32 @@
+{
+  "name": "prism",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-16",
+  "compatibility_flags": ["nodejs_compat", "experimental"],
+  "workers_dev": true,
+
+  "ai": {
+    "binding": "AI"
+  },
+
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "Orchestrator", "name": "Orchestrator" },
+      { "class_name": "Sandbox", "name": "Sandbox" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "new_sqlite_classes": ["Orchestrator", "Sandbox"],
+      "tag": "v1"
+    }
+  ]
+}
