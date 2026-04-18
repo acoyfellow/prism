@@ -9,15 +9,33 @@ export { Sandbox } from "@cloudflare/sandbox";
 
 // --- Constants ---
 
+// Deliberately curated: each language here has to meet TWO bars:
+//   (a) the LLM writes it reliably (qwen2.5-coder-32b is strong on mainstream)
+//   (b) the runtime is small enough to bake into the sandbox image
+//
+// NOT included (intentionally):
+//   - Rust / Java / Scala / Kotlin — need compile step, huge toolchain
+//   - Swift / C# — licensing, installer friction
+//   - Zig / Nim / Crystal / Dart / Julia — not in Debian apt; would need
+//     manual tarball downloads, and LLM output quality is weaker
+//   - Haskell / OCaml / Erlang / Elixir — runtime footprint + LLM weaker
 const LANGUAGES = {
-  python: { ext: "py", command: "python3", displayName: "Python" },
-  javascript: { ext: "js", command: "node", displayName: "JavaScript" },
-  bash: { ext: "sh", command: "bash", displayName: "Bash" },
+  python:     { ext: "py", command: "python3", displayName: "Python" },
+  javascript: { ext: "js", command: "node",    displayName: "JavaScript" },
+  bun:        { ext: "ts", command: "bun run", displayName: "Bun (TypeScript)" },
+  bash:       { ext: "sh", command: "bash",    displayName: "Bash" },
+  ruby:       { ext: "rb", command: "ruby",    displayName: "Ruby" },
+  perl:       { ext: "pl", command: "perl",    displayName: "Perl" },
+  php:        { ext: "php", command: "php",    displayName: "PHP" },
+  go:         { ext: "go", command: "go run",  displayName: "Go" },
+  lua:        { ext: "lua", command: "lua5.4", displayName: "Lua" },
 } as const;
 
 type Language = keyof typeof LANGUAGES;
 
-const SUPPORTED_LANGUAGES: Language[] = ["python", "javascript", "bash"];
+const SUPPORTED_LANGUAGES: Language[] = [
+  "python", "javascript", "bun", "bash", "ruby", "perl", "php", "go", "lua",
+];
 const DEFAULT_LANGUAGE: Language = "python";
 
 // Each runner picks a style from this list (cycled if more runners than styles).
@@ -145,7 +163,13 @@ export class ExperimentRunner extends Agent<Env> {
     }
     if (!script) return err(runnerId, styleName, language, "", "LLM returned empty code");
 
-    const sandbox = getSandbox(this.env.Sandbox, `sandbox-${runnerId}`);
+    // Sandbox ID includes a version tag so bumping SANDBOX_VERSION forces
+    // every runner to spin up a fresh container — picking up a newly-built
+    // image with new language runtimes. Without this, sandboxes persist
+    // their filesystem across deploys and won't have newly-installed apt
+    // packages.
+    const SANDBOX_VERSION = "v2";
+    const sandbox = getSandbox(this.env.Sandbox, `sandbox-${SANDBOX_VERSION}-${runnerId}`);
     const filename = `/workspace/experiment.${lang.ext}`;
     await sandbox.writeFile(filename, script);
 
