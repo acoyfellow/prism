@@ -9,35 +9,37 @@ export { Sandbox } from "@cloudflare/sandbox";
 
 // --- Constants ---
 
-// Each runner gets a different "style" system prompt so the LLM produces
-// genuinely different Python for the same task. Three parallel approaches,
-// one winning runtime.
-const RUNNERS = [
-  {
-    id: "runner-a",
-    style: "minimal",
-    systemPrompt:
-      "You write the shortest correct Python possible. Single function. Standard library only. No comments, no type hints.",
-  },
-  {
-    id: "runner-b",
-    style: "idiomatic",
-    systemPrompt:
-      "You write clean, idiomatic Python. Use generators, comprehensions, and stdlib tools (itertools, functools, collections) where appropriate.",
-  },
-  {
-    id: "runner-c",
-    style: "algorithmic",
-    systemPrompt:
-      "You write Python that optimizes for speed. Prefer lower time complexity over readability. Use efficient data structures.",
-  },
-] as const;
+const LANGUAGES = {
+  python: { ext: "py", command: "python3", displayName: "Python" },
+  javascript: { ext: "js", command: "node", displayName: "JavaScript" },
+  bash: { ext: "sh", command: "bash", displayName: "Bash" },
+} as const;
 
-type Runner = (typeof RUNNERS)[number];
-type RunnerId = Runner["id"];
+type Language = keyof typeof LANGUAGES;
+
+const SUPPORTED_LANGUAGES: Language[] = ["python", "javascript", "bash"];
+const DEFAULT_LANGUAGE: Language = "python";
+
+// Each runner picks a style from this list (cycled if more runners than styles).
+// Styles are language-neutral — they describe coding approach, not syntax.
+const STYLES = [
+  { name: "minimal", prompt: "Write the shortest correct solution possible. Single function. No comments, no extras." },
+  { name: "idiomatic", prompt: "Write clean, idiomatic code. Use the language's preferred constructs and standard library." },
+  { name: "algorithmic", prompt: "Optimize for speed. Prefer lower time complexity over readability. Use efficient data structures." },
+  { name: "functional", prompt: "Use a functional style. Prefer immutability, map/filter/reduce, and higher-order functions where the language supports them." },
+  { name: "verbose", prompt: "Write thoroughly commented, defensively coded solutions. Include input validation and error handling." },
+  { name: "one-liner", prompt: "If possible, express the solution as a single expression or line. Prioritize density over readability." },
+  { name: "recursive", prompt: "Solve this using recursion where reasonable. Avoid iterative loops when a recursive approach works." },
+  { name: "object-oriented", prompt: "Model the problem with at least one class or struct. Use encapsulation and clear method boundaries." },
+  { name: "brute-force", prompt: "Use the simplest, most direct approach — even if it's not optimal. Readability over cleverness." },
+  { name: "clever", prompt: "Use a clever trick or non-obvious insight. Show off." },
+] as const;
 
 const MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
 const MAX_TASK_LENGTH = 500;
+const MIN_RUNNERS = 1;
+const MAX_RUNNERS = 10;
+const DEFAULT_RUNNERS = 3;
 
 // --- Types ---
 
@@ -48,37 +50,71 @@ interface Env {
   API_SECRET: string;
 }
 
+interface RunnerSpec {
+  id: string;      // runner-1, runner-2, ...
+  style: string;   // one of STYLES[i].name
+}
+
 interface ExperimentResult {
-  runner: RunnerId;
+  runner: string;
   style: string;
-  script: string;      // the Python the LLM generated
+  language: Language;
+  script: string;
   stdout: string;
   stderr: string;
-  duration_ms: number; // wall-clock runtime inside the sandbox
+  duration_ms: number;
   status: "done" | "error";
 }
 
 interface SweepSnapshot {
   task: string;
+  language: Language;
+  runners: RunnerSpec[];
   completed: ExperimentResult[];
-  pending: RunnerId[];
+  pending: string[]; // runner ids still to run
   status: "running" | "done" | "error";
+}
+
+// --- Helpers ---
+
+function buildRunners(count: number): RunnerSpec[] {
+  const out: RunnerSpec[] = [];
+  for (let i = 0; i < count; i++) {
+    out.push({
+      id: `runner-${i + 1}`,
+      style: STYLES[i % STYLES.length].name,
+    });
+  }
+  return out;
+}
+
+function stylePrompt(name: string): string {
+  return STYLES.find((s) => s.name === name)?.prompt ?? STYLES[0].prompt;
 }
 
 // --- LLM code generation ---
 
-const BASE_SYSTEM = `You are a Python code generator. Given a task, you output ONLY runnable Python code — no markdown fences, no prose, no explanation. The code must:
-- be a complete, self-contained program
-- use only the Python standard library
-- print meaningful results to stdout (runtime, final value, summary)
+function systemPrompt(language: Language, styleName: string): string {
+  const lang = LANGUAGES[language];
+  return `You are a ${lang.displayName} code generator. Given a task, you output ONLY runnable ${lang.displayName} code — no markdown fences, no prose, no explanation. The code must:
+- be a complete, self-contained program in ${lang.displayName}
+- use only the standard library / built-ins
+- print meaningful results to stdout (result value, summary)
 - time itself and print "runtime_ms: <number>" on the last line
-- finish in under 30 seconds`;
+- finish in under 30 seconds
 
-async function generatePython(ai: Ai, task: string, runner: Runner): Promise<string> {
-  const systemPrompt = `${BASE_SYSTEM}\n\nStyle: ${runner.systemPrompt}`;
+Style: ${stylePrompt(styleName)}`;
+}
+
+async function generateCode(
+  ai: Ai,
+  task: string,
+  language: Language,
+  styleName: string,
+): Promise<string> {
   const response = (await ai.run(MODEL, {
     messages: [
-      { role: "system", content: systemPrompt },
+      { role: "system", content: systemPrompt(language, styleName) },
       { role: "user", content: task },
     ],
     max_tokens: 1024,
@@ -86,36 +122,42 @@ async function generatePython(ai: Ai, task: string, runner: Runner): Promise<str
 
   let code = (response.response ?? "").trim();
   // Strip markdown fences if the model added them despite instructions.
-  code = code.replace(/^```(?:python)?\s*\n?/i, "").replace(/\n?```\s*$/i, "");
+  code = code.replace(/^```(?:\w+)?\s*\n?/i, "").replace(/\n?```\s*$/i, "");
   return code.trim();
 }
 
 // --- Experiment Runner (sub-agent) ---
 
 export class ExperimentRunner extends Agent<Env> {
-  async runExperiment(runnerId: RunnerId, task: string): Promise<ExperimentResult> {
-    const runner = RUNNERS.find((r) => r.id === runnerId);
-    if (!runner) return errorResult(runnerId, "unknown", "", "unknown runner");
+  async runExperiment(
+    runnerId: string,
+    styleName: string,
+    task: string,
+    language: Language,
+  ): Promise<ExperimentResult> {
+    const lang = LANGUAGES[language];
 
     let script = "";
     try {
-      script = await generatePython(this.env.AI, task, runner);
+      script = await generateCode(this.env.AI, task, language, styleName);
     } catch (e) {
-      return errorResult(runnerId, runner.style, "", `codegen failed: ${errString(e)}`);
+      return err(runnerId, styleName, language, "", `codegen failed: ${errString(e)}`);
     }
-    if (!script) return errorResult(runnerId, runner.style, "", "LLM returned empty code");
+    if (!script) return err(runnerId, styleName, language, "", "LLM returned empty code");
 
     const sandbox = getSandbox(this.env.Sandbox, `sandbox-${runnerId}`);
-    await sandbox.writeFile("/workspace/experiment.py", script);
+    const filename = `/workspace/experiment.${lang.ext}`;
+    await sandbox.writeFile(filename, script);
 
     const startedAt = Date.now();
-    const result = await sandbox.exec("python3 /workspace/experiment.py", { timeout: 60_000 });
+    const result = await sandbox.exec(`${lang.command} ${filename}`, { timeout: 60_000 });
     const duration_ms = Date.now() - startedAt;
 
     if (!result.success) {
       return {
         runner: runnerId,
-        style: runner.style,
+        style: styleName,
+        language,
         script,
         stdout: result.stdout?.trim() ?? "",
         stderr: (result.stderr || "execution failed").slice(0, 2000),
@@ -126,7 +168,8 @@ export class ExperimentRunner extends Agent<Env> {
 
     return {
       runner: runnerId,
-      style: runner.style,
+      style: styleName,
+      language,
       script,
       stdout: result.stdout.trim().slice(0, 4000),
       stderr: "",
@@ -136,8 +179,14 @@ export class ExperimentRunner extends Agent<Env> {
   }
 }
 
-function errorResult(runner: RunnerId, style: string, script: string, err: string): ExperimentResult {
-  return { runner, style, script, stdout: "", stderr: err, duration_ms: 0, status: "error" };
+function err(
+  runner: string,
+  style: string,
+  language: Language,
+  script: string,
+  error: string,
+): ExperimentResult {
+  return { runner, style, language, script, stdout: "", stderr: error, duration_ms: 0, status: "error" };
 }
 
 function errString(e: unknown): string {
@@ -159,30 +208,59 @@ export class Orchestrator extends Agent<Env> {
       return new Response("POST required", { status: 405 });
     }
 
-    const body = (await request.json()) as { task?: string };
-    if (!body.task) return Response.json({ error: "missing task" }, { status: 400 });
+    const body = (await request.json()) as {
+      task?: string;
+      language?: Language;
+      runners?: RunnerSpec[];
+    };
 
-    const results = await this.runSweep(body.task);
-    return Response.json({ sweepId: this.name, task: body.task, results });
+    if (!body.task || !body.language || !body.runners) {
+      return Response.json({ error: "missing task/language/runners" }, { status: 400 });
+    }
+
+    const results = await this.runSweep(body.task, body.language, body.runners);
+    return Response.json({
+      sweepId: this.name,
+      task: body.task,
+      language: body.language,
+      results,
+    });
   }
 
-  async runSweep(task: string): Promise<ExperimentResult[]> {
-    const runnerIds: RunnerId[] = RUNNERS.map((r) => r.id);
-
+  async runSweep(
+    task: string,
+    language: Language,
+    runners: RunnerSpec[],
+  ): Promise<ExperimentResult[]> {
     return this.runFiber("sweep", async (ctx) => {
-      this.persistSnapshot({ task, completed: [], pending: runnerIds, status: "running" });
-      ctx.stash({ task, completed: [], pending: runnerIds, status: "running" } satisfies SweepSnapshot);
+      const initial: SweepSnapshot = {
+        task,
+        language,
+        runners,
+        completed: [],
+        pending: runners.map((r) => r.id),
+        status: "running",
+      };
+      this.persistSnapshot(initial);
+      ctx.stash(initial);
 
       const results = await Promise.all(
-        runnerIds.map(async (id) => {
-          const stub = await this.subAgent(ExperimentRunner, id);
-          return stub.runExperiment(id, task);
+        runners.map(async (r) => {
+          const stub = await this.subAgent(ExperimentRunner, r.id);
+          return stub.runExperiment(r.id, r.style, task, language);
         }),
       );
 
-      const finalSnapshot: SweepSnapshot = { task, completed: results, pending: [], status: "done" };
-      this.persistSnapshot(finalSnapshot);
-      ctx.stash(finalSnapshot);
+      const final: SweepSnapshot = {
+        task,
+        language,
+        runners,
+        completed: results,
+        pending: [],
+        status: "done",
+      };
+      this.persistSnapshot(final);
+      ctx.stash(final);
       return results;
     });
   }
@@ -210,26 +288,22 @@ export class Orchestrator extends Agent<Env> {
 
   async onFiberRecovered(ctx: FiberRecoveryContext) {
     if (ctx.name !== "sweep") return;
-    const snapshot = ctx.snapshot as SweepSnapshot | null;
-    if (!snapshot || snapshot.pending.length === 0 || snapshot.status !== "running") return;
+    const snap = ctx.snapshot as SweepSnapshot | null;
+    if (!snap || snap.pending.length === 0 || snap.status !== "running") return;
 
     void this.runFiber("sweep", async (fiberCtx) => {
-      const results = [...snapshot.completed];
+      const results = [...snap.completed];
+      const pendingRunners = snap.runners.filter((r) => snap.pending.includes(r.id));
       const remaining = await Promise.all(
-        snapshot.pending.map(async (id) => {
-          const stub = await this.subAgent(ExperimentRunner, id);
-          return stub.runExperiment(id, snapshot.task);
+        pendingRunners.map(async (r) => {
+          const stub = await this.subAgent(ExperimentRunner, r.id);
+          return stub.runExperiment(r.id, r.style, snap.task, snap.language);
         }),
       );
       results.push(...remaining);
-      const finalSnapshot: SweepSnapshot = {
-        task: snapshot.task,
-        completed: results,
-        pending: [],
-        status: "done",
-      };
-      this.persistSnapshot(finalSnapshot);
-      fiberCtx.stash(finalSnapshot);
+      const final: SweepSnapshot = { ...snap, completed: results, pending: [], status: "done" };
+      this.persistSnapshot(final);
+      fiberCtx.stash(final);
     });
   }
 }
@@ -238,7 +312,6 @@ export class Orchestrator extends Agent<Env> {
 
 const app = new Hono<{ Bindings: Env }>();
 
-// Fail closed before auth: if API_SECRET isn't set, refuse every request.
 app.use("*", async (c, next) => {
   if (!c.env.API_SECRET) {
     return c.json(
@@ -249,30 +322,36 @@ app.use("*", async (c, next) => {
   return next();
 });
 
-// Bearer auth on everything.
 app.use("*", (c, next) => bearerAuth({ token: c.env.API_SECRET })(c, next));
 
 app.get("/", (c) =>
   c.json({
     name: "prism",
     description:
-      "Parallel Python execution on Cloudflare. The orchestrator generates different Python approaches via Workers AI and runs each in its own sandbox.",
+      "Parallel code execution on Cloudflare. The orchestrator generates different approaches via Workers AI in your chosen language, and runs each in its own sandbox.",
     usage: {
-      start: 'POST / with { "task": "<description in English>" }',
+      start: 'POST / with { "task": "...", "language"?: "python"|"javascript"|"bash", "runners"?: 1-10 }',
       poll: "GET /sweeps/<sweepId>",
     },
-    runners: RUNNERS.map((r) => ({ id: r.id, style: r.style })),
+    languages: SUPPORTED_LANGUAGES.map((l) => ({
+      id: l,
+      displayName: LANGUAGES[l].displayName,
+      command: LANGUAGES[l].command,
+    })),
+    runners: { min: MIN_RUNNERS, max: MAX_RUNNERS, default: DEFAULT_RUNNERS },
+    styles: STYLES.map((s) => s.name),
   }),
 );
 
 app.post("/", async (c) => {
-  let body: { task?: unknown };
+  let body: { task?: unknown; language?: unknown; runners?: unknown };
   try {
     body = await c.req.json();
   } catch {
     throw new HTTPException(400, { message: "invalid JSON body" });
   }
 
+  // Validate task
   if (typeof body.task !== "string" || body.task.length === 0) {
     throw new HTTPException(400, { message: "missing 'task' in request body" });
   }
@@ -281,8 +360,31 @@ app.post("/", async (c) => {
       message: `task must be under ${MAX_TASK_LENGTH} characters`,
     });
   }
-
   const task = body.task.replace(/[\x00-\x1f\x7f]/g, "");
+
+  // Validate language
+  const language: Language =
+    body.language == null ? DEFAULT_LANGUAGE : (body.language as Language);
+  if (!SUPPORTED_LANGUAGES.includes(language)) {
+    throw new HTTPException(400, {
+      message: `unsupported language: ${String(body.language)}. supported: ${SUPPORTED_LANGUAGES.join(", ")}`,
+    });
+  }
+
+  // Validate runner count
+  const runnerCount =
+    body.runners == null
+      ? DEFAULT_RUNNERS
+      : typeof body.runners === "number"
+      ? body.runners
+      : NaN;
+  if (!Number.isInteger(runnerCount) || runnerCount < MIN_RUNNERS || runnerCount > MAX_RUNNERS) {
+    throw new HTTPException(400, {
+      message: `runners must be an integer between ${MIN_RUNNERS} and ${MAX_RUNNERS}`,
+    });
+  }
+
+  const runners = buildRunners(runnerCount);
   const sweepId = crypto.randomUUID();
   const stub = await getAgentByName(c.env.Orchestrator, sweepId);
 
@@ -290,7 +392,7 @@ app.post("/", async (c) => {
     new Request(new URL(c.req.url).toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task }),
+      body: JSON.stringify({ task, language, runners }),
     }),
   );
 });
@@ -303,9 +405,9 @@ app.get("/sweeps/:id{[0-9a-f-]{36}}", async (c) => {
 
 app.notFound((c) => c.json({ error: "not found" }, 404));
 
-app.onError((err, c) => {
-  if (err instanceof HTTPException) return err.getResponse();
-  return c.json({ error: errString(err) }, 500);
+app.onError((e, c) => {
+  if (e instanceof HTTPException) return e.getResponse();
+  return c.json({ error: errString(e) }, 500);
 });
 
 export default app;
