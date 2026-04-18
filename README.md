@@ -4,11 +4,9 @@ One task in, split into parallel beams, aggregated results out.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jcoeyman/prism)
 
-Prism is a parallel experiment runner on Cloudflare. One orchestrator fans out sub-agents that execute Python in isolated Linux containers. Every step checkpoints to SQLite. If the Durable Object is evicted mid-sweep, the work resumes on the next activation.
+Prism is a parallel experiment runner on Cloudflare. One orchestrator fans out sub-agents that each generate and execute code — in Python, JavaScript, or Bash — inside isolated Linux containers. Every runner uses a different coding style (minimal, idiomatic, algorithmic, functional, and more). Every step checkpoints to SQLite. If the Durable Object is evicted mid-sweep, the work resumes on the next activation.
 
 Built on [the Agent class](https://developers.cloudflare.com/agents/api-reference/think/), [sub-agents](https://developers.cloudflare.com/agents/api-reference/sub-agents/), [durable execution](https://developers.cloudflare.com/agents/api-reference/durable-execution/), and [Sandbox](https://developers.cloudflare.com/sandbox/).
-
-> **Note:** The three example runners are pure-Python simulations, not real ML frameworks. The demo is about the pattern (parallel agents → sandboxes → aggregated results), not the training code. To run real training, increase the Sandbox instance type and swap in real `pip install` + real model code. See [How-to: swap in a real framework](#swap-in-a-real-framework).
 
 ---
 
@@ -43,17 +41,40 @@ Save the secret — you'll need it on every request. For belt-and-suspenders, ad
 curl -X POST https://prism.<your-subdomain>.workers.dev \
   -H "Authorization: Bearer <your-secret>" \
   -H "Content-Type: application/json" \
-  -d '{"task": "best learning rate for a tiny ResNet on CIFAR-10"}'
+  -d '{"task": "print the 1000th prime number"}'
+```
+
+`language` defaults to `python` and `runners` defaults to `3`. Pass them explicitly to override:
+
+```sh
+curl -X POST https://prism.<your-subdomain>.workers.dev \
+  -H "Authorization: Bearer <your-secret>" \
+  -H "Content-Type: application/json" \
+  -d '{"task": "fibonacci sequence up to 100", "language": "javascript", "runners": 5}'
 ```
 
 Response:
 ```json
 {
   "sweepId": "b5e...a91",
+  "task": "print the 1000th prime number",
+  "language": "python",
   "results": [
-    { "runner": "runner-a", "output": "{\"best_lr\": 0.0001, ...}", "status": "done" },
-    { "runner": "runner-b", "output": "{\"best_lr\": 0.1, ...}", "status": "done" },
-    { "runner": "runner-c", "output": "{\"best_lr\": 0.1, ...}", "status": "done" }
+    {
+      "runner": "runner-1", "style": "minimal", "language": "python",
+      "script": "...", "stdout": "7919\nruntime_ms: 12", "stderr": "",
+      "duration_ms": 95, "status": "done"
+    },
+    {
+      "runner": "runner-2", "style": "idiomatic", "language": "python",
+      "script": "...", "stdout": "7919\nruntime_ms: 14", "stderr": "",
+      "duration_ms": 101, "status": "done"
+    },
+    {
+      "runner": "runner-3", "style": "algorithmic", "language": "python",
+      "script": "...", "stdout": "7919\nruntime_ms: 8", "stderr": "",
+      "duration_ms": 88, "status": "done"
+    }
   ]
 }
 ```
@@ -73,11 +94,35 @@ If the Orchestrator was evicted mid-sweep, `onFiberRecovered` picks up the remai
 
 > *Task-oriented. Solve a specific problem.*
 
+### Choose a language
+
+Pass `"language"` in the POST body. Supported values:
+
+| Value | Runtime | Default? |
+|---|---|---|
+| `python` | `python3` | ✓ |
+| `javascript` | `node` | |
+| `bash` | `bash` | |
+
+```sh
+-d '{"task": "...", "language": "javascript"}'
+```
+
+### Control the number of runners
+
+Pass `"runners"` (integer 1–10) to set how many parallel runners spin up. Defaults to `3`.
+
+```sh
+-d '{"task": "...", "runners": 7}'
+```
+
+Each runner is assigned a different coding style from the ten built-in styles: `minimal`, `idiomatic`, `algorithmic`, `functional`, `verbose`, `one-liner`, `recursive`, `object-oriented`, `brute-force`, `clever`. Styles cycle if you run more than 10 runners.
+
 ### Swap in a real framework
 
 The included runners are pure-Python simulations so the demo works on the smallest Sandbox instance. For real training:
 
-1. Increase the Sandbox `instance_type` in `wrangler.toml` (e.g. `"standard"` or larger).
+1. Increase the Sandbox `instance_type` in `wrangler.json` (e.g. `"standard"` or larger).
 2. In `ExperimentRunner.runExperiment`, add a `sandbox.exec("pip install <your-packages>")` step before writing the script.
 3. Replace the body of `experimentScript` with real model code.
 
@@ -89,26 +134,22 @@ await sandbox.writeFile("/workspace/experiment.py", myRealTrainingScript);
 
 ### Add another runner
 
-Edit the `RUNNERS` array in `src/index.ts`:
+Pass a higher `runners` value in the POST body — no code changes needed. Runners are built dynamically (1–10), and each one gets a distinct style automatically.
 
-```ts
-const RUNNERS = ["runner-a", "runner-b", "runner-c", "runner-d"] as const;
+```sh
+-d '{"task": "...", "runners": 5}'
 ```
-
-Add a corresponding script in `experimentScript`. The orchestrator fans out to all of them automatically.
 
 ### Change the base container image
 
-Edit `Dockerfile` or switch the `FROM` line to any Cloudflare Sandbox variant. The current image is `cloudflare/sandbox:0.8.11` with `python3` installed on top.
+Edit `Dockerfile` or switch the `FROM` line to any Cloudflare Sandbox variant. The current image is `cloudflare/sandbox:0.8.11` with `python3` and `nodejs` installed on top (bash is always present).
 
 ### Add R2 checkpointing for large artifacts
 
-Bind an R2 bucket in `wrangler.toml`:
+Bind an R2 bucket in `wrangler.json`:
 
-```toml
-[[r2_buckets]]
-binding = "R2"
-bucket_name = "prism-artifacts"
+```json
+"r2_buckets": [{ "binding": "R2", "bucket_name": "prism-artifacts" }]
 ```
 
 Then use `sandbox.createBackup()` / `sandbox.restoreBackup()` to snapshot the filesystem between runs. See the [Sandbox backup/restore docs](https://developers.cloudflare.com/sandbox/guides/backup-restore/).
@@ -145,15 +186,11 @@ The Worker + Orchestrator + sub-agents run locally. Sandbox containers require D
                       +--------------+
                       | Orchestrator |  (Agent + runFiber + stash)
                       +--------------+
-                       /      |      \
-               subAgent  subAgent  subAgent
-                  /          |          \
-  +------------+  +------------+  +------------+
-  |  runner-a  |  |  runner-b  |  |  runner-c  |
-  +------------+  +------------+  +------------+
-        |               |                |
-    Sandbox         Sandbox          Sandbox
-    (python3)       (python3)        (python3)
+                   /    /    |    \    \
+              sub  sub  sub  sub  sub  ...  (1–10 runners, dynamic)
+               |    |    |    |    |
+           Sandbox  Sandbox  Sandbox  ...
+           (py/js/sh) ...
 ```
 
 ### Components
@@ -168,23 +205,49 @@ The Worker + Orchestrator + sub-agents run locally. Sandbox containers require D
 
 ### API
 
-**`GET /`** — returns a JSON landing document describing usage.
+**`GET /`** — returns a JSON landing document describing usage, supported languages, runner range, and available styles.
 
 **`POST /`** — starts a new sweep.
 
 Request:
 ```json
-{ "task": "<description, max 500 chars>" }
+{
+  "task": "<description, max 500 chars>",
+  "language": "python",
+  "runners": 3
+}
 ```
+
+`language` is optional (default `python`; supported: `python`, `javascript`, `bash`).
+`runners` is optional (default `3`; range `1`–`10`).
 
 Response:
 ```json
 {
   "sweepId": "<uuid>",
+  "task": "...",
+  "language": "python",
   "results": [
-    { "runner": "runner-a", "output": "...", "status": "done" },
-    { "runner": "runner-b", "output": "...", "status": "done" },
-    { "runner": "runner-c", "output": "...", "status": "done" }
+    {
+      "runner": "runner-1",
+      "style": "minimal",
+      "language": "python",
+      "script": "...",
+      "stdout": "...",
+      "stderr": "",
+      "duration_ms": 95,
+      "status": "done"
+    },
+    {
+      "runner": "runner-2",
+      "style": "idiomatic",
+      "language": "python",
+      "script": "...",
+      "stdout": "...",
+      "stderr": "",
+      "duration_ms": 101,
+      "status": "done"
+    }
   ]
 }
 ```
@@ -211,8 +274,8 @@ If `API_SECRET` is set, every request requires `Authorization: Bearer <secret>`.
 prism/
   src/index.ts           # Orchestrator + ExperimentRunner + fetch handler
   test/e2e.test.ts       # Real-endpoint tests (no mocks)
-  wrangler.toml          # Bindings: DO, Sandbox, containers
-  Dockerfile             # Sandbox container image (Python 3)
+  wrangler.json          # Bindings: DO, Sandbox, containers
+  Dockerfile             # Sandbox container image (Python 3 + Node.js)
   package.json           # 2 runtime dependencies
   tsconfig.json
   .dev.vars.example      # Local secret template
@@ -242,7 +305,7 @@ The standard pattern for parallel agent work on Cloudflare is: one Agent orchest
 
 ### Why sub-agents instead of separate Durable Objects
 
-Sub-agents (facets) are co-located on the same machine as the parent. RPC between parent and child is an in-process call, not a network hop. Each child still gets fully isolated SQLite — you can't accidentally corrupt parent state. And you only need one DO binding in `wrangler.toml` for the parent; children are discovered via the parent's runtime.
+Sub-agents (facets) are co-located on the same machine as the parent. RPC between parent and child is an in-process call, not a network hop. Each child still gets fully isolated SQLite — you can't accidentally corrupt parent state. And you only need one DO binding in `wrangler.json` for the parent; children are discovered via the parent's runtime.
 
 ### Why `runFiber` instead of Workflows
 
