@@ -260,35 +260,77 @@ export class ExperimentRunner extends Agent<Env> {
       `sandbox-${SANDBOX_VERSION}-${language}-${runnerId}`,
     );
     const filename = `/workspace/experiment.${lang.ext}`;
-    await sandbox.writeFile(filename, script);
-
     const startedAt = Date.now();
-    const result = await sandbox.exec(`${lang.command} ${filename}`, { timeout: 60_000 });
-    const duration_ms = Date.now() - startedAt;
 
-    if (!result.success) {
+    // Hard outer timeout. Cloudflare Durable Objects cap any single
+    // subrequest at ~30s — if we let sandbox.exec hang past that, the
+    // whole DO gets reset with "Internal error in Durable Object storage
+    // caused object to be reset" and the client sees HTTP 500.
+    //
+    // We cap at 25s (with 5s headroom for JSON serialization and the
+    // parent Promise.all overhead) and return a structured timeout result
+    // so the sweep can still report partial successes from other runners.
+    //
+    // First-time sandbox cold starts can take 2-3 minutes to pull the
+    // container image. Those requests will always time out; subsequent
+    // requests to the same sandbox ID hit a warm container and finish
+    // in hundreds of ms. See SANDBOX_VERSION comment above.
+    const RUNNER_TIMEOUT_MS = 25_000;
+
+    try {
+      const result = await Promise.race([
+        (async () => {
+          await sandbox.writeFile(filename, script);
+          return await sandbox.exec(`${lang.command} ${filename}`, { timeout: 60_000 });
+        })(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`runner timed out after ${RUNNER_TIMEOUT_MS}ms`)),
+            RUNNER_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+      const duration_ms = Date.now() - startedAt;
+
+      if (!result.success) {
+        return {
+          runner: runnerId,
+          style: styleName,
+          language,
+          script,
+          stdout: result.stdout?.trim() ?? "",
+          stderr: (result.stderr || "execution failed").slice(0, 2000),
+          duration_ms,
+          status: "error",
+        };
+      }
+
       return {
         runner: runnerId,
         style: styleName,
         language,
         script,
-        stdout: result.stdout?.trim() ?? "",
-        stderr: (result.stderr || "execution failed").slice(0, 2000),
+        stdout: result.stdout.trim().slice(0, 4000),
+        stderr: "",
+        duration_ms,
+        status: "done",
+      };
+    } catch (e) {
+      const duration_ms = Date.now() - startedAt;
+      const msg = errString(e);
+      return {
+        runner: runnerId,
+        style: styleName,
+        language,
+        script,
+        stdout: "",
+        stderr: msg.includes("timed out")
+          ? `${msg} — sandbox may still be cold-starting; subsequent sweeps will be faster`
+          : msg,
         duration_ms,
         status: "error",
       };
     }
-
-    return {
-      runner: runnerId,
-      style: styleName,
-      language,
-      script,
-      stdout: result.stdout.trim().slice(0, 4000),
-      stderr: "",
-      duration_ms,
-      status: "done",
-    };
   }
 }
 
