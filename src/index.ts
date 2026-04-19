@@ -263,19 +263,20 @@ export class ExperimentRunner extends Agent<Env> {
     const startedAt = Date.now();
 
     // Hard outer timeout. Cloudflare Durable Objects cap any single
-    // subrequest at ~30s — if we let sandbox.exec hang past that, the
+    // subrequest at ~30s. If we let sandbox.exec hang past that, the
     // whole DO gets reset with "Internal error in Durable Object storage
     // caused object to be reset" and the client sees HTTP 500.
     //
-    // We cap at 25s (with 5s headroom for JSON serialization and the
-    // parent Promise.all overhead) and return a structured timeout result
-    // so the sweep can still report partial successes from other runners.
+    // 20s cap leaves ~10s of headroom — enough for LLM codegen (which
+    // happens BEFORE this timer starts) + JSON serialization + the
+    // parent Promise.all overhead.
     //
-    // First-time sandbox cold starts can take 2-3 minutes to pull the
-    // container image. Those requests will always time out; subsequent
-    // requests to the same sandbox ID hit a warm container and finish
-    // in hundreds of ms. See SANDBOX_VERSION comment above.
-    const RUNNER_TIMEOUT_MS = 25_000;
+    // Two things trigger this timeout, both legitimate:
+    //   1. LLM wrote code that takes >20s (deep recursion, Sudoku-style
+    //      backtracking, pathological Bash one-liners, sleep/while loops)
+    //   2. Sandbox cold start — first call to a sandbox ID after idle
+    //      eviction pays a ~2-3min container boot cost
+    const RUNNER_TIMEOUT_MS = 20_000;
 
     try {
       const result = await Promise.race([
@@ -318,6 +319,12 @@ export class ExperimentRunner extends Agent<Env> {
     } catch (e) {
       const duration_ms = Date.now() - startedAt;
       const msg = errString(e);
+      // Be honest about why a timeout happened. Two real causes:
+      //   (1) LLM-generated code that's genuinely slow (recursion,
+      //       backtracking, shell-loops doing O(n^2) work, etc.)
+      //   (2) Sandbox cold start — first call to this sandbox ID after
+      //       idle eviction pays a container boot cost.
+      // The user can't tell which; the stderr names both.
       return {
         runner: runnerId,
         style: styleName,
@@ -325,7 +332,7 @@ export class ExperimentRunner extends Agent<Env> {
         script,
         stdout: "",
         stderr: msg.includes("timed out")
-          ? `${msg} — sandbox may still be cold-starting; subsequent sweeps will be faster`
+          ? `${msg} — either the LLM wrote code that took too long to execute, or the sandbox was cold-starting. retry usually works.`
           : msg,
         duration_ms,
         status: "error",
